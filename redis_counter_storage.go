@@ -1,10 +1,16 @@
 package access_limiter
 
 import (
+	"github.com/gogap/errors"
 	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
+)
+
+const (
+	_COUNTER_ = ":_counter_:"
+	_CONFIG_  = ":_config_:"
 )
 
 type RedisConfig struct {
@@ -17,6 +23,9 @@ type RedisConfig struct {
 	Db       int
 
 	Prefix string
+
+	Transaction     bool
+	ConsistentRetry int
 }
 
 type RedisCounterStorage struct {
@@ -27,6 +36,22 @@ type RedisCounterStorage struct {
 
 func NewRedisCounterStorage(config RedisConfig) CounterStorage {
 	storage := new(RedisCounterStorage)
+
+	if config.IdleTimeout <= 0 {
+		config.IdleTimeout = time.Second
+	}
+
+	if config.ConsistentRetry < 0 {
+		config.ConsistentRetry = 3
+	}
+
+	if config.MaxIdle <= 0 {
+		config.MaxIdle = 1
+	}
+
+	if config.MaxActive <= 0 {
+		config.MaxActive = 1
+	}
 
 	storage.redisConfig = config
 
@@ -58,7 +83,7 @@ func (p *RedisCounterStorage) initalPool() {
 	}
 }
 
-func (p *RedisCounterStorage) Increase(counterName string, count int64, dimensions ...string) (err error) {
+func (p *RedisCounterStorage) Increase(counterName string, count, max int64, dimensions ...string) (err error) {
 	conn := p.pool.Get()
 	defer conn.Close()
 
@@ -67,7 +92,44 @@ func (p *RedisCounterStorage) Increase(counterName string, count int64, dimensio
 		dimKey = strings.Join(dimensions, ":")
 	}
 
-	_, err = conn.Do("HINCRBY", p.redisConfig.Prefix+":_counter_:"+counterName, dimKey, count)
+	key := p.redisConfig.Prefix + _COUNTER_ + counterName + ":" + dimKey
+
+	if max > 0 && p.redisConfig.Transaction {
+		for i := 0; i < p.redisConfig.ConsistentRetry+1; i++ {
+
+			if _, err = conn.Do("WATCH", key); err != nil {
+				continue
+			}
+
+			var reply interface{}
+			if reply, err = conn.Do("GET", key); err != nil {
+				continue
+			}
+
+			intV, _ := redis.Int64(reply, err)
+
+			if max > 0 && intV+count > max {
+				conn.Do("UNWATCH")
+				err = ERR_QUOTA_REACHED_UPPER_LIMIT.New(errors.Params{"counter": counterName, "dimensions": strings.Join(dimensions, ":")})
+				return
+			}
+
+			if err = conn.Send("MULTI"); err != nil {
+				continue
+			}
+			if err = conn.Send("SET", key, intV+count); err != nil {
+				continue
+			}
+
+			if _, err = conn.Do("EXEC"); err != nil {
+				continue
+			} else {
+				break
+			}
+		}
+	} else {
+		_, err = conn.Do("INCRBY", key, count)
+	}
 
 	return
 }
@@ -81,11 +143,7 @@ func (p *RedisCounterStorage) Delete(counterName string, dimensions ...string) (
 		dimKey = strings.Join(dimensions, ":")
 	}
 
-	if dimKey != "" {
-		_, err = conn.Do("HDEL", p.redisConfig.Prefix+":_counter_:"+counterName, dimKey)
-	} else {
-		_, err = conn.Do("DEL", p.redisConfig.Prefix+":_counter_:"+counterName)
-	}
+	_, err = conn.Do("DEL", p.redisConfig.Prefix+_COUNTER_+counterName+":"+dimKey)
 
 	return
 }
@@ -99,7 +157,7 @@ func (p *RedisCounterStorage) SetValue(counterName string, value int64, dimensio
 		dimKey = strings.Join(dimensions, ":")
 	}
 
-	_, err = conn.Do("HSET", p.redisConfig.Prefix+":_counter_:"+counterName, dimKey, value)
+	_, err = conn.Do("SET", p.redisConfig.Prefix+_COUNTER_+counterName+":"+dimKey, value)
 	return
 }
 
@@ -112,7 +170,7 @@ func (p *RedisCounterStorage) GetValue(counterName string, dimensions ...string)
 		dimKey = strings.Join(dimensions, ":")
 	}
 
-	v, err := conn.Do("HGET", p.redisConfig.Prefix+":_counter_:"+counterName, dimKey)
+	v, err := conn.Do("GET", p.redisConfig.Prefix+_COUNTER_+counterName+":"+dimKey)
 
 	if dimVal, err = redis.Int64(v, err); err == nil {
 		exist = true
@@ -129,7 +187,9 @@ func (p *RedisCounterStorage) GetSumValue(counterName string, dimensionsGroup []
 	conn := p.pool.Get()
 	defer conn.Close()
 
-	dimKeys := []interface{}{p.redisConfig.Prefix + ":_counter_:" + counterName}
+	keyPrefix := p.redisConfig.Prefix + _COUNTER_ + counterName
+
+	keys := []interface{}{}
 
 	for _, dim := range dimensionsGroup {
 		dimKey := ""
@@ -137,10 +197,10 @@ func (p *RedisCounterStorage) GetSumValue(counterName string, dimensionsGroup []
 			dimKey = strings.Join(dim, ":")
 		}
 
-		dimKeys = append(dimKeys, dimKey)
+		keys = append(keys, keyPrefix+":"+dimKey)
 	}
 
-	vals, err := conn.Do("HMGET", dimKeys...)
+	vals, err := conn.Do("MGET", keys...)
 
 	var intVals []int
 	if intVals, err = redis.Ints(vals, err); err != nil {
@@ -157,11 +217,11 @@ func (p *RedisCounterStorage) GetSumValue(counterName string, dimensionsGroup []
 	return
 }
 
-func (p *RedisCounterStorage) GetOption(counterName, key string) (opts []CounterOption, exist bool) {
+func (p *RedisCounterStorage) GetOptions(counterName, key string) (opts []CounterOption, exist bool) {
 	conn := p.pool.Get()
 	defer conn.Close()
 
-	redisKey := p.redisConfig.Prefix + ":_config_:" + counterName + ":" + key
+	redisKey := p.redisConfig.Prefix + _CONFIG_ + counterName + ":" + key
 
 	vals, err := conn.Do("HGETALL", redisKey)
 
@@ -186,7 +246,7 @@ func (p *RedisCounterStorage) SetOptions(counterName, key string, opts ...Counte
 	conn := p.pool.Get()
 	defer conn.Close()
 
-	redisKey := p.redisConfig.Prefix + ":_config_:" + counterName + ":" + key
+	redisKey := p.redisConfig.Prefix + _CONFIG_ + counterName + ":" + key
 
 	args := []interface{}{redisKey}
 	for _, opt := range opts {

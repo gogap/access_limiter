@@ -1,6 +1,7 @@
 package access_limiter
 
 import (
+	"github.com/gogap/errors"
 	"strings"
 	"sync"
 )
@@ -26,7 +27,7 @@ func (p *MemoryCounterStorage) ensureCounterExist(counterName string) {
 	}
 }
 
-func (p *MemoryCounterStorage) Increase(counterName string, count int64, dimensions ...string) (err error) {
+func (p *MemoryCounterStorage) Increase(counterName string, count, max int64, dimensions ...string) (err error) {
 	p.counterLocker.Lock()
 	defer p.counterLocker.Unlock()
 
@@ -37,6 +38,11 @@ func (p *MemoryCounterStorage) Increase(counterName string, count int64, dimensi
 	dimKey := ""
 	if dimensions != nil {
 		dimKey = strings.Join(dimensions, ":")
+	}
+
+	if max > 0 && dims[dimKey]+count > max {
+		err = ERR_QUOTA_REACHED_UPPER_LIMIT.New(errors.Params{"counter": counterName, "dimensions": strings.Join(dimensions, ":")})
+		return
 	}
 
 	dims[dimKey] = dims[dimKey] + count
@@ -136,7 +142,7 @@ func (p *MemoryCounterStorage) GetSumValue(counterName string, dimensionsGroup [
 	return
 }
 
-func (p *MemoryCounterStorage) GetOption(counterName, key string) (opts []CounterOption, exist bool) {
+func (p *MemoryCounterStorage) GetOptions(counterName, key string) (opts []CounterOption, exist bool) {
 	opts, exist = p.kv[counterName+":"+key]
 	return
 }

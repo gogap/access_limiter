@@ -8,21 +8,28 @@ import (
 	"time"
 )
 
+const (
+	_CONSUME_ = ":_consume_"
+	_QPS_     = ":_qps_"
+)
+
 type ClassicCounter struct {
 	name    string
 	storage CounterStorage
 
-	cacheLocker     sync.Mutex
-	cachedOptions   map[string][]CounterOption
-	latestCacheTime time.Time
+	cacheLocker      sync.Mutex
+	cachedOptions    map[string][]CounterOption
+	cachedDimOptions map[string]string
+	latestCacheTime  time.Time
 }
 
 func NewClassicCounter(name string, storage CounterStorage) Counter {
 	return &ClassicCounter{
-		name:            name,
-		storage:         storage,
-		cachedOptions:   make(map[string][]CounterOption),
-		latestCacheTime: time.Now(),
+		name:             name,
+		storage:          storage,
+		cachedOptions:    make(map[string][]CounterOption),
+		cachedDimOptions: make(map[string]string),
+		latestCacheTime:  time.Now(),
 	}
 }
 
@@ -31,35 +38,27 @@ func (p *ClassicCounter) Name() (name string) {
 }
 
 func (p *ClassicCounter) Consume(count int64, dimensions ...string) (err error) {
-	if !p.IsCanConsume(count, dimensions...) {
-		err = ERR_COULD_NOT_CONSUMUE.New(errors.Params{"counter": p.name})
+
+	defer func() {
+		go p.updateQPSCounter(err != nil, dimensions...)
+	}()
+
+	if p.isReachedQPSUpperLimit(dimensions...) {
+		err = ERR_QPS_REACHED_UPPER_LIMIT.New(errors.Params{"counter": p.name, "dimensions": strings.Join(dimensions, ":")})
 		return
 	}
 
-	if e := p.storage.Increase(p.name, count, dimensions...); e != nil {
-		err = ERR_INCREASE_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
-		return
+	var maxQuota int64 = 0
+	if v, exist := p.getDimensionOption(LimitQuotaOption, dimensions...); exist {
+		maxQuota, _ = strconv.ParseInt(v, 10, 64)
 	}
 
-	nowSec := time.Now().Second()
-	index := nowSec % 5
-	nextIndex := (nowSec + 1) % 5
-
-	dimPrefix := ""
-	if dimensions != nil {
-		dimPrefix = strings.Join(dimensions, ":")
-	}
-
-	qpsDims := []string{dimPrefix, "qps", strconv.Itoa(index)}
-
-	if e := p.storage.Increase(p.name, 1, qpsDims...); e != nil {
-		err = ERR_INCREASE_QPS_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
-		return
-	}
-
-	nextQPSDims := []string{dimPrefix, "qps", strconv.Itoa(nextIndex)}
-	if e := p.storage.SetValue(p.name, 0, nextQPSDims...); e != nil {
-		err = ERR_RESET_QPS_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
+	if e := p.storage.Increase(p.name+_CONSUME_, count, maxQuota, dimensions...); e != nil {
+		if errors.IsErrCode(e) {
+			err = e
+		} else {
+			err = ERR_INCREASE_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
+		}
 		return
 	}
 
@@ -67,62 +66,26 @@ func (p *ClassicCounter) Consume(count int64, dimensions ...string) (err error) 
 }
 
 func (p *ClassicCounter) IsCanConsume(count int64, dimensions ...string) (isCan bool) {
-	if opts, e := p.GetOptions(dimensions...); e != nil {
+
+	isCan = true
+
+	go p.updateQPSCounter(true, dimensions...)
+
+	if p.isReachedQuotaUpperLimit(dimensions...) {
 		isCan = false
 		return
-	} else {
-		isCan = true
-		for _, opt := range opts {
-			if opt.Name == "limit_quota" {
-				optVal, _ := strconv.ParseInt(opt.Value, 10, 64)
+	}
 
-				isCan = optVal == -1
-
-				dimV, _ := p.storage.GetValue(p.name, dimensions...)
-
-				isCan = dimV+count <= optVal
-			} else if opt.Name == "limit_qps" {
-				optVal, _ := strconv.ParseInt(opt.Value, 10, 64)
-
-				dimPrefix := ""
-				if optVal > 0 {
-
-					if dimensions != nil {
-						dimPrefix = strings.Join(dimensions, ":")
-					}
-
-					dimGroup := p.dimensionGroup(dimPrefix)
-
-					sumV, _ := p.storage.GetSumValue(p.name, dimGroup)
-
-					isCan = (sumV+count)/int64(len(dimGroup)-1) <= optVal
-				} else {
-					isCan = true
-				}
-
-			}
-
-			if !isCan {
-				dimPrefix := ""
-
-				if dimensions != nil {
-					dimPrefix = strings.Join(dimensions, ":")
-				}
-
-				nowSec := time.Now().Second()
-				nextIndex := (nowSec + 1) % 5
-				nextQPSDims := []string{dimPrefix, "qps", strconv.Itoa(nextIndex)}
-				p.storage.SetValue(p.name, 0, nextQPSDims...)
-				return
-			}
-		}
+	if p.isReachedQPSUpperLimit(dimensions...) {
+		isCan = false
+		return
 	}
 
 	return
 }
 
 func (p *ClassicCounter) Reset(dimensions ...string) (err error) {
-	if e := p.storage.Delete(p.name, dimensions...); e != nil {
+	if e := p.storage.Delete(p.name+_CONSUME_, dimensions...); e != nil {
 		err = ERR_RESET_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
 		return
 	}
@@ -131,11 +94,11 @@ func (p *ClassicCounter) Reset(dimensions ...string) (err error) {
 
 func (p *ClassicCounter) dimensionGroup(prefix string) [][]string {
 	return [][]string{
-		{prefix, "qps:0"},
-		{prefix, "qps:1"},
-		{prefix, "qps:2"},
-		{prefix, "qps:3"},
-		{prefix, "qps:4"}}
+		{prefix, "0"},
+		{prefix, "1"},
+		{prefix, "2"},
+		{prefix, "3"},
+		{prefix, "4"}}
 }
 
 func (p *ClassicCounter) ConsumeSpeed(dimensions ...string) (speed int64) {
@@ -146,7 +109,7 @@ func (p *ClassicCounter) ConsumeSpeed(dimensions ...string) (speed int64) {
 
 	dimGroup := p.dimensionGroup(dimPrefix)
 
-	sumV, _ := p.storage.GetSumValue(p.name, dimGroup)
+	sumV, _ := p.storage.GetSumValue(p.name+_QPS_, dimGroup)
 
 	speed = sumV / int64(len(dimGroup)-1)
 
@@ -159,7 +122,19 @@ func (p *ClassicCounter) UpdateOptions(opts []CounterOption, dimensions ...strin
 		optKey = strings.Join(dimensions, ":")
 	}
 
-	p.storage.SetOptions(p.name, optKey, opts...)
+	if e := p.storage.SetOptions(p.name, optKey, opts...); e != nil {
+		err = ERR_UPDATE_OPTIONS_FAILED.New(errors.Params{"counter": p.name, "err": e})
+		return
+	} else {
+		p.cacheLocker.Lock()
+		defer p.cacheLocker.Unlock()
+
+		p.cachedOptions[optKey] = opts
+
+		for _, opt := range opts {
+			p.cachedDimOptions[optKey+":"+string(opt.Name)] = opt.Value
+		}
+	}
 
 	return
 }
@@ -181,11 +156,16 @@ func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption,
 		return
 	}
 
-	if v, exist := p.storage.GetOption(p.name, optKey); exist {
+	if v, exist := p.storage.GetOptions(p.name, optKey); exist {
 		p.cacheLocker.Lock()
 		defer p.cacheLocker.Unlock()
 
 		p.cachedOptions[optKey] = v
+
+		for _, opt := range v {
+			p.cachedDimOptions[optKey+":"+string(opt.Name)] = opt.Value
+		}
+
 		opts = v
 		return
 	} else if v, exist := p.cachedOptions[optKey]; exist {
@@ -196,4 +176,71 @@ func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption,
 		return
 	}
 	return
+}
+
+func (p *ClassicCounter) getDimensionOption(optName OptionName, dimensions ...string) (v string, exist bool) {
+	optKey := ""
+	if dimensions != nil {
+		optKey = strings.Join(dimensions, ":")
+	}
+
+	v, exist = p.cachedDimOptions[optKey+":"+string(optName)]
+
+	return
+}
+
+func (p *ClassicCounter) isReachedQPSUpperLimit(dimensions ...string) bool {
+	var optVal int64 = 0
+
+	if strOptv, exist := p.getDimensionOption(LimitQPSOption, dimensions...); !exist {
+		return false
+	} else {
+		optVal, _ = strconv.ParseInt(strOptv, 10, 64)
+	}
+
+	if optVal > 0 {
+		return p.ConsumeSpeed(dimensions...) > optVal
+	}
+
+	return false
+}
+
+func (p *ClassicCounter) isReachedQuotaUpperLimit(dimensions ...string) bool {
+	var optVal int64 = 0
+
+	if strOptv, exist := p.getDimensionOption(LimitQuotaOption, dimensions...); !exist {
+		return false
+	} else {
+		optVal, _ = strconv.ParseInt(strOptv, 10, 64)
+	}
+
+	if optVal == -1 {
+		return false
+	}
+
+	dimV, _ := p.storage.GetValue(p.name+_CONSUME_, dimensions...)
+
+	return dimV > optVal
+}
+
+func (p *ClassicCounter) updateQPSCounter(resetOnly bool, dimensions ...string) {
+	nowSec := time.Now().Second()
+	index := nowSec % 5
+
+	dimPrefix := ""
+	if dimensions != nil {
+		dimPrefix = strings.Join(dimensions, ":")
+	}
+
+	if !resetOnly {
+		qpsDims := []string{dimPrefix, strconv.Itoa(index)}
+
+		if e := p.storage.Increase(p.name+_QPS_, 1, 0, qpsDims...); e != nil {
+			return
+		}
+	}
+
+	nextIndex := (time.Now().Second() + 1) % 5
+	nextQPSDims := []string{dimPrefix, strconv.Itoa(nextIndex)}
+	p.storage.SetValue(p.name+_QPS_, 0, nextQPSDims...)
 }
