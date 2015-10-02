@@ -52,5 +52,12 @@ func main() {
 		}
 	}(counter)
 
+	go func() {
+		for {
+			time.Sleep(time.Second * 1)
+			fmt.Println("")
+		}
+	}()
+
 	time.Sleep(time.Minute * 60)
 }

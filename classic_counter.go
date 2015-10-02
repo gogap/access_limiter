@@ -17,20 +17,30 @@ type ClassicCounter struct {
 	name    string
 	storage CounterStorage
 
-	cacheLocker      sync.Mutex
-	cachedOptions    map[string][]CounterOption
-	cachedDimOptions map[string]string
-	latestCacheTime  time.Time
+	cacheLocker        sync.Mutex
+	cachedOptions      map[string][]CounterOption
+	cachedDimOptions   map[string]string
+	latestOptCacheTime time.Time
+
+	qpsCacheLocker sync.Mutex
+	cachedQPSCount map[string]int64
+	cachedQPS      map[string]int64
 }
 
 func NewClassicCounter(name string, storage CounterStorage) Counter {
-	return &ClassicCounter{
-		name:             name,
-		storage:          storage,
-		cachedOptions:    make(map[string][]CounterOption),
-		cachedDimOptions: make(map[string]string),
-		latestCacheTime:  time.Now(),
+	counter := &ClassicCounter{
+		name:               name,
+		storage:            storage,
+		cachedOptions:      make(map[string][]CounterOption),
+		cachedDimOptions:   make(map[string]string),
+		latestOptCacheTime: time.Now(),
+		cachedQPSCount:     make(map[string]int64),
+		cachedQPS:          make(map[string]int64),
 	}
+
+	counter.beginSyncQPSCounter()
+
+	return counter
 }
 
 func (p *ClassicCounter) Name() (name string) {
@@ -40,7 +50,7 @@ func (p *ClassicCounter) Name() (name string) {
 func (p *ClassicCounter) Consume(count int64, dimensions ...string) (err error) {
 
 	defer func() {
-		go p.updateQPSCounter(err != nil, dimensions...)
+		go p.increaseQPSCount(1, dimensions...)
 	}()
 
 	if p.isReachedQPSUpperLimit(dimensions...) {
@@ -68,8 +78,6 @@ func (p *ClassicCounter) Consume(count int64, dimensions ...string) (err error) 
 func (p *ClassicCounter) IsCanConsume(count int64, dimensions ...string) (isCan bool) {
 
 	isCan = true
-
-	go p.updateQPSCounter(true, dimensions...)
 
 	if p.isReachedQuotaUpperLimit(dimensions...) {
 		isCan = false
@@ -107,11 +115,7 @@ func (p *ClassicCounter) ConsumeSpeed(dimensions ...string) (speed int64) {
 		dimPrefix = strings.Join(dimensions, ":")
 	}
 
-	dimGroup := p.dimensionGroup(dimPrefix)
-
-	sumV, _ := p.storage.GetSumValue(p.name+_QPS_, dimGroup)
-
-	speed = sumV / int64(len(dimGroup)-1)
+	speed, _ = p.cachedQPS[dimPrefix]
 
 	return
 }
@@ -145,10 +149,10 @@ func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption,
 		optKey = strings.Join(dimensions, ":")
 	}
 
-	cacheTimeUp := int32(time.Now().Sub(p.latestCacheTime).Seconds()) >= 10
+	cacheTimeUp := int32(time.Now().Sub(p.latestOptCacheTime).Seconds()) >= 10
 
 	if cacheTimeUp {
-		p.latestCacheTime = time.Now()
+		p.latestOptCacheTime = time.Now()
 	}
 
 	if v, exist := p.cachedOptions[optKey]; exist && !cacheTimeUp {
@@ -223,24 +227,61 @@ func (p *ClassicCounter) isReachedQuotaUpperLimit(dimensions ...string) bool {
 	return dimV > optVal
 }
 
-func (p *ClassicCounter) updateQPSCounter(resetOnly bool, dimensions ...string) {
+func (p *ClassicCounter) beginSyncQPSCounter() {
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			p.syncQPSCounter()
+		}
+	}()
+}
+
+func (p *ClassicCounter) syncQPSCounter() {
 	nowSec := time.Now().Second()
 	index := nowSec % 5
 
-	dimPrefix := ""
-	if dimensions != nil {
-		dimPrefix = strings.Join(dimensions, ":")
-	}
-
-	if !resetOnly {
-		qpsDims := []string{dimPrefix, strconv.Itoa(index)}
-
-		if e := p.storage.Increase(p.name+_QPS_, 1, 0, qpsDims...); e != nil {
-			return
-		}
-	}
-
 	nextIndex := (time.Now().Second() + 1) % 5
-	nextQPSDims := []string{dimPrefix, strconv.Itoa(nextIndex)}
-	p.storage.SetValue(p.name+_QPS_, 0, nextQPSDims...)
+
+	for dimPrefix, val := range p.cachedQPSCount {
+		qpsDims := []string{dimPrefix, strconv.Itoa(index)}
+		if e := p.storage.Increase(p.name+_QPS_, val, 0, qpsDims...); e != nil {
+			continue
+		}
+
+		nextQPSDims := []string{dimPrefix, strconv.Itoa(nextIndex)}
+		p.storage.SetValue(p.name+_QPS_, 0, nextQPSDims...)
+
+		dimGroup := p.dimensionGroup(dimPrefix)
+
+		sumV, _ := p.storage.GetSumValue(p.name+_QPS_, dimGroup)
+
+		p.cachedQPS[dimPrefix] = sumV / int64(len(dimGroup)-1)
+	}
+	p.clearQPSCount()
+}
+
+func (p *ClassicCounter) increaseQPSCount(count int64, dimensions ...string) {
+	key := ""
+	if dimensions != nil {
+		key = strings.Join(dimensions, ":")
+	}
+
+	p.qpsCacheLocker.Lock()
+	defer p.qpsCacheLocker.Unlock()
+
+	if val, exist := p.cachedQPSCount[key]; exist {
+		val += count
+		p.cachedQPSCount[key] = val
+	} else {
+		p.cachedQPSCount[key] = count
+	}
+}
+
+func (p *ClassicCounter) clearQPSCount() {
+	p.qpsCacheLocker.Lock()
+	defer p.qpsCacheLocker.Unlock()
+
+	for k, _ := range p.cachedQPSCount {
+		p.cachedQPSCount[k] = 0
+	}
 }
