@@ -92,11 +92,19 @@ func (p *ClassicCounter) IsCanConsume(count int64, dimensions ...string) (isCan 
 	return
 }
 
-func (p *ClassicCounter) Reset(dimensions ...string) (err error) {
-	if e := p.storage.Delete(p.name+_CONSUME_, dimensions...); e != nil {
-		err = ERR_RESET_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
-		return
+func (p *ClassicCounter) Reset(quota int64, dimensions ...string) (err error) {
+	if quota <= 0 {
+		if e := p.storage.Delete(p.name+_CONSUME_, dimensions...); e != nil {
+			err = ERR_RESET_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
+			return
+		}
+	} else {
+		if e := p.storage.SetValue(p.name+_CONSUME_, quota, dimensions...); e != nil {
+			err = ERR_RESET_COUNT_FAILED.New(errors.Params{"counter": p.name, "err": e})
+			return
+		}
 	}
+
 	return
 }
 

@@ -48,7 +48,7 @@ func main() {
 		for {
 			time.Sleep(time.Second * 20)
 			fmt.Println("\nReset Quota....")
-			counter.Reset("shoes", "oid-001")
+			counter.Reset(0, "shoes", "oid-001")
 		}
 	}(counter)
 

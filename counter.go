@@ -16,7 +16,7 @@ type Counter interface {
 	Name() (name string)
 	Consume(count int64, dimensions ...string) (err error)
 	IsCanConsume(count int64, dimensions ...string) (isCan bool)
-	Reset(dimensions ...string) (err error)
+	Reset(quota int64, dimensions ...string) (err error)
 	ConsumeSpeed(dimensions ...string) (speed int64)
 	UpdateOptions(opts []CounterOption, dimensions ...string) (err error)
 	GetOptions(dimensions ...string) (opts []CounterOption, err error)
