@@ -117,13 +117,28 @@ func (p *ClassicCounter) dimensionGroup(prefix string) [][]string {
 		{prefix, "4"}}
 }
 
+func (p *ClassicCounter) localConsumeSpeed(prefix string) (speed int64) {
+	if val, exist := p.cachedQPSCount[prefix]; exist {
+		speed = val
+	} else {
+		speed = 0
+	}
+	return
+}
+
 func (p *ClassicCounter) ConsumeSpeed(dimensions ...string) (speed int64) {
 	dimPrefix := ""
 	if dimensions != nil {
 		dimPrefix = strings.Join(dimensions, ":")
 	}
 
+	localSpeed := p.localConsumeSpeed(dimPrefix)
+
 	speed, _ = p.cachedQPS[dimPrefix]
+
+	if localSpeed > speed {
+		speed = localSpeed
+	}
 
 	return
 }
