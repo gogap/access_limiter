@@ -1,6 +1,7 @@
 package access_limiter
 
 import (
+	"encoding/json"
 	"github.com/gogap/errors"
 	"strings"
 	"time"
@@ -10,7 +11,7 @@ import (
 
 const (
 	_COUNTER_ = ":_counter_:"
-	_CONFIG_  = ":_config_:"
+	_CONFIG_  = ":_counter_:_config_:"
 )
 
 type RedisConfig struct {
@@ -217,20 +218,21 @@ func (p *RedisCounterStorage) GetSumValue(counterName string, dimensionsGroup []
 	return
 }
 
-func (p *RedisCounterStorage) GetOptions(counterName, key string) (opts []CounterOption, exist bool) {
+func (p *RedisCounterStorage) GetOptions(counterName, key string) (opts CounterOptions, exist bool) {
 	conn := p.pool.Get()
 	defer conn.Close()
 
 	redisKey := p.redisConfig.Prefix + _CONFIG_ + counterName + ":" + key
 
-	vals, err := conn.Do("HGETALL", redisKey)
+	vals, err := conn.Do("GET", redisKey)
 
-	if kvVals, e := redis.StringMap(vals, err); e != nil {
+	if data, e := redis.Bytes(vals, err); e != nil {
 		exist = false
 		return
 	} else {
-		for k, v := range kvVals {
-			opts = append(opts, CounterOption{OptionName(k), v})
+		if e := json.Unmarshal(data, &opts); e != nil {
+			exist = false
+			return
 		}
 		exist = true
 	}
@@ -238,7 +240,7 @@ func (p *RedisCounterStorage) GetOptions(counterName, key string) (opts []Counte
 	return
 }
 
-func (p *RedisCounterStorage) SetOptions(counterName, key string, opts ...CounterOption) (err error) {
+func (p *RedisCounterStorage) SetOptions(counterName, key string, opts CounterOptions) (err error) {
 	if opts == nil || len(opts) == 0 {
 		return
 	}
@@ -248,12 +250,14 @@ func (p *RedisCounterStorage) SetOptions(counterName, key string, opts ...Counte
 
 	redisKey := p.redisConfig.Prefix + _CONFIG_ + counterName + ":" + key
 
-	args := []interface{}{redisKey}
-	for _, opt := range opts {
-		args = append(args, opt.Name, opt.Value)
+	var js []byte
+	if js, err = json.Marshal(opts); err != nil {
+		return
 	}
 
-	_, err = conn.Do("HMSET", args...)
+	args := []interface{}{redisKey, js}
+
+	_, err = conn.Do("SET", args...)
 
 	return
 }

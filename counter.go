@@ -1,16 +1,11 @@
 package access_limiter
 
-type OptionName string
-
 const (
-	LimitQuotaOption OptionName = "limit_quota"
-	LimitQPSOption              = "limit_qps"
+	LimitQuotaOption = "limit_quota"
+	LimitQPSOption   = "limit_qps"
 )
 
-type CounterOption struct {
-	Name  OptionName
-	Value string
-}
+type CounterOptions map[string]interface{}
 
 type Counter interface {
 	Name() (name string)
@@ -18,6 +13,6 @@ type Counter interface {
 	IsCanConsume(count int64, dimensions ...string) (isCan bool)
 	Reset(quota int64, dimensions ...string) (err error)
 	ConsumeSpeed(dimensions ...string) (speed int64)
-	UpdateOptions(opts []CounterOption, dimensions ...string) (err error)
-	GetOptions(dimensions ...string) (opts []CounterOption, err error)
+	UpdateOptions(opts CounterOptions, dimensions ...string) (err error)
+	GetOptions(dimensions ...string) (opts CounterOptions, err error)
 }

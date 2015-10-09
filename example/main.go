@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	//storage := access_limiter.NewMemoryCounterStorage()
+	// storage := access_limiter.NewMemoryCounterStorage()
 
 	redisConfig := access_limiter.RedisConfig{
 		Address:         "127.0.0.1:6379",
@@ -24,19 +24,29 @@ func main() {
 
 	counter := access_limiter.NewClassicCounter("test", storage)
 
-	counter.UpdateOptions([]access_limiter.CounterOption{
-		{access_limiter.LimitQuotaOption, "15000"},
-		{access_limiter.LimitQPSOption, "1000"},
+	counter.UpdateOptions(access_limiter.CounterOptions{
+		access_limiter.LimitQuotaOption: 15000,
+		access_limiter.LimitQPSOption:   1000,
 	}, "shoes", "oid-001")
 
 	go func(counter access_limiter.Counter) {
 		i := 0
+		var err error
 
 		for {
 			now := time.Now().Format("2006-01-02 15:04:05")
 
-			if err := counter.Consume(1, "shoes", "oid-001"); err != nil {
+			if err = counter.Consume(1, "shoes", "oid-001"); err != nil {
 				fmt.Printf("\r× %s, QPS: %10d consumed: %10d.", now, counter.ConsumeSpeed("shoes", "oid-001"), i)
+
+				if access_limiter.ERR_QPS_REACHED_UPPER_LIMIT.IsEqual(err) {
+					fmt.Printf(" | - QPS reached upper limit")
+					time.Sleep(time.Millisecond * 10)
+				} else if access_limiter.ERR_QUOTA_REACHED_UPPER_LIMIT.IsEqual(err) {
+					fmt.Printf(" | - Quota reached upper limit")
+					time.Sleep(time.Second)
+				}
+
 			} else {
 				i += 1
 				fmt.Printf("\r√ %s, QPS: %10d consumed: %10d.", now, counter.ConsumeSpeed("shoes", "oid-001"), i)

@@ -18,8 +18,7 @@ type ClassicCounter struct {
 	storage CounterStorage
 
 	cacheLocker        sync.Mutex
-	cachedOptions      map[string][]CounterOption
-	cachedDimOptions   map[string]string
+	cachedOptions      map[string]CounterOptions
 	latestOptCacheTime time.Time
 
 	qpsCacheLocker sync.Mutex
@@ -31,8 +30,7 @@ func NewClassicCounter(name string, storage CounterStorage) Counter {
 	counter := &ClassicCounter{
 		name:               name,
 		storage:            storage,
-		cachedOptions:      make(map[string][]CounterOption),
-		cachedDimOptions:   make(map[string]string),
+		cachedOptions:      make(map[string]CounterOptions),
 		latestOptCacheTime: time.Now(),
 		cachedQPSCount:     make(map[string]int64),
 		cachedQPS:          make(map[string]int64),
@@ -60,7 +58,9 @@ func (p *ClassicCounter) Consume(count int64, dimensions ...string) (err error) 
 
 	var maxQuota int64 = 0
 	if v, exist := p.getDimensionOption(LimitQuotaOption, dimensions...); exist {
-		maxQuota, _ = strconv.ParseInt(v, 10, 64)
+		if intV, ok := v.(int); ok {
+			maxQuota = int64(intV)
+		}
 	}
 
 	if e := p.storage.Increase(p.name+_CONSUME_, count, maxQuota, dimensions...); e != nil {
@@ -143,13 +143,13 @@ func (p *ClassicCounter) ConsumeSpeed(dimensions ...string) (speed int64) {
 	return
 }
 
-func (p *ClassicCounter) UpdateOptions(opts []CounterOption, dimensions ...string) (err error) {
+func (p *ClassicCounter) UpdateOptions(opts CounterOptions, dimensions ...string) (err error) {
 	optKey := ""
 	if dimensions != nil {
 		optKey = strings.Join(dimensions, ":")
 	}
 
-	if e := p.storage.SetOptions(p.name, optKey, opts...); e != nil {
+	if e := p.storage.SetOptions(p.name, optKey, opts); e != nil {
 		err = ERR_UPDATE_OPTIONS_FAILED.New(errors.Params{"counter": p.name, "err": e})
 		return
 	} else {
@@ -157,16 +157,12 @@ func (p *ClassicCounter) UpdateOptions(opts []CounterOption, dimensions ...strin
 		defer p.cacheLocker.Unlock()
 
 		p.cachedOptions[optKey] = opts
-
-		for _, opt := range opts {
-			p.cachedDimOptions[optKey+":"+string(opt.Name)] = opt.Value
-		}
 	}
 
 	return
 }
 
-func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption, err error) {
+func (p *ClassicCounter) GetOptions(dimensions ...string) (opts CounterOptions, err error) {
 	optKey := ""
 	if dimensions != nil {
 		optKey = strings.Join(dimensions, ":")
@@ -188,12 +184,8 @@ func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption,
 		defer p.cacheLocker.Unlock()
 
 		p.cachedOptions[optKey] = v
-
-		for _, opt := range v {
-			p.cachedDimOptions[optKey+":"+string(opt.Name)] = opt.Value
-		}
-
 		opts = v
+
 		return
 	} else if v, exist := p.cachedOptions[optKey]; exist {
 		opts = v
@@ -205,13 +197,19 @@ func (p *ClassicCounter) GetOptions(dimensions ...string) (opts []CounterOption,
 	return
 }
 
-func (p *ClassicCounter) getDimensionOption(optName OptionName, dimensions ...string) (v string, exist bool) {
+func (p *ClassicCounter) getDimensionOption(optName string, dimensions ...string) (v interface{}, exist bool) {
 	optKey := ""
 	if dimensions != nil {
 		optKey = strings.Join(dimensions, ":")
 	}
 
-	v, exist = p.cachedDimOptions[optKey+":"+string(optName)]
+	var opts CounterOptions
+
+	if opts, exist = p.cachedOptions[optKey]; !exist {
+		return
+	} else if v, exist = opts[optName]; exist {
+		return
+	}
 
 	return
 }
@@ -219,10 +217,12 @@ func (p *ClassicCounter) getDimensionOption(optName OptionName, dimensions ...st
 func (p *ClassicCounter) isReachedQPSUpperLimit(dimensions ...string) bool {
 	var optVal int64 = 0
 
-	if strOptv, exist := p.getDimensionOption(LimitQPSOption, dimensions...); !exist {
+	if v, exist := p.getDimensionOption(LimitQPSOption, dimensions...); !exist {
 		return false
+	} else if intV, ok := v.(int); ok {
+		optVal = int64(intV)
 	} else {
-		optVal, _ = strconv.ParseInt(strOptv, 10, 64)
+		return false
 	}
 
 	if optVal > 0 {
@@ -235,10 +235,12 @@ func (p *ClassicCounter) isReachedQPSUpperLimit(dimensions ...string) bool {
 func (p *ClassicCounter) isReachedQuotaUpperLimit(dimensions ...string) bool {
 	var optVal int64 = 0
 
-	if strOptv, exist := p.getDimensionOption(LimitQuotaOption, dimensions...); !exist {
+	if v, exist := p.getDimensionOption(LimitQuotaOption, dimensions...); !exist {
 		return false
+	} else if intV, ok := v.(int); ok {
+		optVal = int64(intV)
 	} else {
-		optVal, _ = strconv.ParseInt(strOptv, 10, 64)
+		return true
 	}
 
 	if optVal == -1 {

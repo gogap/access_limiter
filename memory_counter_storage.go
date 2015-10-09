@@ -11,13 +11,13 @@ type MemoryCounterStorage struct {
 	optionLocker  sync.Mutex
 
 	counter map[string]map[string]int64
-	kv      map[string][]CounterOption
+	kv      map[string]CounterOptions
 }
 
 func NewMemoryCounterStorage() CounterStorage {
 	return &MemoryCounterStorage{
 		counter: make(map[string]map[string]int64),
-		kv:      make(map[string][]CounterOption),
+		kv:      make(map[string]CounterOptions),
 	}
 }
 
@@ -142,12 +142,12 @@ func (p *MemoryCounterStorage) GetSumValue(counterName string, dimensionsGroup [
 	return
 }
 
-func (p *MemoryCounterStorage) GetOptions(counterName, key string) (opts []CounterOption, exist bool) {
+func (p *MemoryCounterStorage) GetOptions(counterName, key string) (opts CounterOptions, exist bool) {
 	opts, exist = p.kv[counterName+":"+key]
 	return
 }
 
-func (p *MemoryCounterStorage) SetOptions(counterName, key string, opts ...CounterOption) (err error) {
+func (p *MemoryCounterStorage) SetOptions(counterName, key string, opts CounterOptions) (err error) {
 	if opts == nil {
 		return
 	}
